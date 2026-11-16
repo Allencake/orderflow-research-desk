@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地数据和密钥，不要提交
+.env
+server/ledger.csv
+server/replies.log
+*.log
+
+# 系统文件
+.DS_Store

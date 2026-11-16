@@ -1,0 +1,265 @@
+// This Pine Script® code is subject to the terms of the MIT License.
+// © 2026 Allencake
+//
+// Orderflow Research Desk —— 纸面研究指标（paper only）
+// 只做结构识别和纸面记录，不下单，不构成投资建议，不承诺收益。
+// 建议用在 5 分钟图上。
+
+//@version=5
+indicator("Orderflow Research Desk (paper only)", shorttitle = "OF Desk", overlay = true, max_boxes_count = 50, max_lines_count = 300, max_labels_count = 300)
+
+// ───────────── 输入 ─────────────
+grpBias = "1. 大方向 (1h / 4h)"
+htf1      = input.timeframe("60", "大周期 A", group = grpBias)
+htf2      = input.timeframe("240", "大周期 B", group = grpBias)
+emaLen    = input.int(50, "EMA 长度", minval = 5, group = grpBias)
+slopeLen  = input.int(3, "EMA 斜率回看根数", minval = 1, group = grpBias)
+needBias  = input.bool(true, "只做和大方向一致的一边", group = grpBias)
+
+grpValue = "2. 成交密集区 (当日 VWAP ± 标准差)"
+bandMult  = input.float(1.0, "标准差倍数", minval = 0.1, step = 0.1, group = grpValue)
+needValue = input.bool(true, "多头只在阴影下方、空头只在阴影上方", group = grpValue)
+
+grpFib = "3. 斐波那契区域"
+pivotLen  = input.int(10, "波段识别长度 (左右各 N 根)", minval = 2, group = grpFib)
+fibA      = input.float(0.705, "回撤下沿", minval = 0.0, maxval = 1.0, step = 0.001, group = grpFib)
+fibB      = input.float(0.886, "回撤上沿", minval = 0.0, maxval = 1.0, step = 0.001, group = grpFib)
+
+grpFlow = "4. 第二次失败结构"
+volLen    = input.int(20, "均量长度", minval = 2, group = grpFlow)
+volMult   = input.float(1.5, "放量倍数 (高于均量)", minval = 1.0, step = 0.1, group = grpFlow)
+bodyMin   = input.float(0.55, "实体占比下限 (砸得凶)", minval = 0.1, maxval = 1.0, step = 0.05, group = grpFlow)
+wickMin   = input.float(0.40, "长影线占比下限", minval = 0.1, maxval = 1.0, step = 0.05, group = grpFlow)
+stopAtr   = input.float(0.10, "止损缓冲 (ATR 倍数)", minval = 0.0, step = 0.05, group = grpFlow)
+rrMult    = input.float(2.0, "目标 = 风险的几倍", minval = 0.5, step = 0.5, group = grpFlow)
+
+grpPaper = "5. 纸面规则"
+maxPerDay  = input.int(2, "每天最多记几笔", minval = 1, group = grpPaper)
+maxLossDay = input.int(2, "当天亏满几笔就停记", minval = 1, group = grpPaper)
+lineLen    = input.int(30, "价位线长度 (根)", minval = 5, maxval = 400, group = grpPaper)
+
+// ───────────── 1. 大方向：1h / 4h，不重绘 ─────────────
+// 返回上一根已收盘大周期 K 线的状态：1 = 向上，-1 = 向下，0 = 平衡。
+// 用 [1] + lookahead_on 是 TradingView 官方推荐的不重绘写法：
+// 只读已经收盘的大周期 K 线，历史和实时结果一致，也不会偷看未来。
+htfState() =>
+    e  = ta.ema(close, emaLen)
+    up = e[1] > e[1 + slopeLen] and close[1] > e[1]
+    dn = e[1] < e[1 + slopeLen] and close[1] < e[1]
+    up ? 1 : dn ? -1 : 0
+
+stateA = nz(request.security(syminfo.tickerid, htf1, htfState(), lookahead = barmerge.lookahead_on))
+stateB = nz(request.security(syminfo.tickerid, htf2, htfState(), lookahead = barmerge.lookahead_on))
+
+int bias = stateA == 1 and stateB == 1 ? 1 : stateA == -1 and stateB == -1 ? -1 : 0
+string biasTxt = bias == 1 ? "VALUE UP" : bias == -1 ? "VALUE DOWN" : "BALANCE"
+
+// ───────────── 2. 成交密集区：当日 VWAP ± 标准差 ─────────────
+newDay = timeframe.change("D")
+[vwMid, vwUp, vwLo] = ta.vwap(hlc3, newDay, bandMult)
+
+pUp  = plot(vwUp, "密集区上沿", color = color.new(color.gray, 60))
+pLo  = plot(vwLo, "密集区下沿", color = color.new(color.gray, 60))
+plot(vwMid, "当日 VWAP", color = color.new(color.gray, 30), style = plot.style_circles, linewidth = 1)
+fill(pUp, pLo, color = color.new(color.gray, 88), title = "成交密集区")
+
+string locTxt = close < vwLo ? "BELOW_VALUE" : close > vwUp ? "ABOVE_VALUE" : "IN_VALUE"
+
+// ───────────── 3. 最近波段 + 0.705–0.886 绿框 ─────────────
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float swingHi    = na
+var int   swingHiBar = na
+var float swingLo    = na
+var int   swingLoBar = na
+bool newPivot = false
+
+if not na(ph)
+    swingHi    := ph
+    swingHiBar := bar_index - pivotLen
+    newPivot   := true
+if not na(pl)
+    swingLo    := pl
+    swingLoBar := bar_index - pivotLen
+    newPivot   := true
+
+var box   zoneBox  = na
+var float zTop     = na
+var float zBot     = na
+var int   zSide    = 0      // 1 = 多头回撤区（先低后高），-1 = 空头反弹区（先高后低）
+var bool  zoneLive = false
+var int   fails    = 0      // 区内“砸了没砸穿”的次数
+var float failExt  = na     // 两次失败里的最极端价（多头取最低，空头取最高）
+
+fibLoR = math.min(fibA, fibB)
+fibHiR = math.max(fibA, fibB)
+
+if newPivot and not na(swingHi) and not na(swingLo) and swingHi > swingLo
+    rng = swingHi - swingLo
+    if swingLoBar < swingHiBar
+        // 上涨波段：低点在前，高点在后，往下回撤 0.705–0.886
+        zSide := 1
+        zTop  := swingHi - rng * fibLoR
+        zBot  := swingHi - rng * fibHiR
+    else
+        // 下跌波段：高点在前，低点在后，往上反弹 0.705–0.886
+        zSide := -1
+        zTop  := swingLo + rng * fibHiR
+        zBot  := swingLo + rng * fibLoR
+    zoneLive := true
+    fails    := 0
+    failExt  := na
+    box.delete(zoneBox)
+    leftBar = math.min(swingHiBar, swingLoBar)
+    zoneBox := box.new(leftBar, zTop, bar_index, zBot, border_color = color.new(color.green, 20), bgcolor = color.new(color.green, 85), text = "0.705–0.886", text_color = color.new(color.green, 0), text_size = size.small, text_halign = text.align_right, text_valign = text.align_top)
+
+if not na(zoneBox)
+    box.set_right(zoneBox, bar_index)
+
+// 区域被收盘价击穿就作废
+if zoneLive and zSide == 1 and close < zBot
+    zoneLive := false
+if zoneLive and zSide == -1 and close > zTop
+    zoneLive := false
+
+// ───────────── 4. 区内“砸了两次都没砸穿” ─────────────
+volAvg  = ta.sma(volume, volLen)
+atr     = ta.atr(14)
+barRng  = high - low
+bodyR   = barRng > 0 ? math.abs(close - open) / barRng : 0.0
+lowWick = barRng > 0 ? (math.min(open, close) - low) / barRng : 0.0
+upWick  = barRng > 0 ? (high - math.max(open, close)) / barRng : 0.0
+bigVol  = volume > volAvg * volMult
+touch   = high >= zBot and low <= zTop
+
+// 多头侧：空头放量砸（大阴线或长下影），但收盘没跌破前一根低点 → 一次失败
+bearHit    = bigVol and (close < open and bodyR >= bodyMin or lowWick >= wickMin)
+bearFailed = bearHit and close >= low[1]
+// 空头侧：多头放量拉（大阳线或长上影），但收盘没站上前一根高点 → 一次失败
+bullHit    = bigVol and (close > open and bodyR >= bodyMin or upWick >= wickMin)
+bullFailed = bullHit and close <= high[1]
+
+biasOkLong  = not needBias or bias == 1
+biasOkShort = not needBias or bias == -1
+locOkLong   = not needValue or locTxt == "BELOW_VALUE"
+locOkShort  = not needValue or locTxt == "ABOVE_VALUE"
+
+bool longSetup  = false
+bool shortSetup = false
+
+if zoneLive and touch and zSide == 1 and bearFailed
+    fails   := fails + 1
+    failExt := na(failExt) ? low : math.min(failExt, low)
+    if fails == 1
+        label.new(bar_index, low, "失败 1", style = label.style_label_up, color = color.new(color.green, 70), textcolor = color.white, size = size.tiny)
+    else if fails >= 2
+        longSetup := biasOkLong and locOkLong
+        zoneLive  := false
+
+if zoneLive and touch and zSide == -1 and bullFailed
+    fails   := fails + 1
+    failExt := na(failExt) ? high : math.max(failExt, high)
+    if fails == 1
+        label.new(bar_index, high, "失败 1", style = label.style_label_down, color = color.new(color.red, 70), textcolor = color.white, size = size.tiny)
+    else if fails >= 2
+        shortSetup := biasOkShort and locOkShort
+        zoneLive   := false
+
+// ───────────── 5. 纸面规则：每天最多 2 笔，亏 2 笔停记 ─────────────
+var int   dayRecords = 0
+var int   dayLosses  = 0
+var int   posSide    = 0     // 0 = 无纸面记录，1 = 多，-1 = 空
+var float posWatch   = na
+var float posStop    = na
+var float posTarget  = na
+var int   totalWins  = 0
+var int   totalLoss  = 0
+
+if newDay
+    dayRecords := 0
+    dayLosses  := 0
+
+fmtP = "#.##########"
+
+zoneJson() =>
+    '{"top":' + str.tostring(zTop, fmtP) + ',"bottom":' + str.tostring(zBot, fmtP) + ',"fib":"' + str.tostring(fibLoR) + '-' + str.tostring(fibHiR) + '"}'
+
+payload(string event, int side, string structure, float watch, float stop, float target, string result) =>
+    '{"event":"' + event + '"' +
+     ',"symbol":"' + syminfo.ticker + '"' +
+     ',"exchange":"' + syminfo.prefix + '"' +
+     ',"tf":"' + timeframe.period + '"' +
+     ',"bias":"' + biasTxt + '"' +
+     ',"htf":{"' + htf1 + '":' + str.tostring(stateA) + ',"' + htf2 + '":' + str.tostring(stateB) + '}' +
+     ',"location":"' + locTxt + '"' +
+     ',"side":"' + (side == 1 ? "long" : "short") + '"' +
+     ',"zone":' + zoneJson() +
+     ',"structure":"' + structure + '"' +
+     ',"watch":' + str.tostring(watch, fmtP) +
+     ',"stop":' + str.tostring(stop, fmtP) +
+     ',"target":' + str.tostring(target, fmtP) +
+     ',"result":"' + result + '"' +
+     ',"paper_today":{"records":' + str.tostring(dayRecords) + ',"losses":' + str.tostring(dayLosses) + '}' +
+     ',"ts":' + str.tostring(time_close, "#") + '}'
+
+// 先结算已有的纸面记录（保守：同一根 K 线同时碰到止损和目标，按止损算）
+if posSide != 0 and barstate.isconfirmed
+    bool hitStop   = posSide == 1 ? low <= posStop : high >= posStop
+    bool hitTarget = posSide == 1 ? high >= posTarget : low <= posTarget
+    if hitStop or hitTarget
+        string res = hitStop ? "stop" : "target"
+        if hitStop
+            dayLosses := dayLosses + 1
+            totalLoss := totalLoss + 1
+        else
+            totalWins := totalWins + 1
+        float px = hitStop ? posStop : posTarget
+        label.new(bar_index, px, hitStop ? "纸面：止损" : "纸面：到目标", style = label.style_label_left, color = hitStop ? color.new(color.red, 20) : color.new(color.teal, 20), textcolor = color.white, size = size.small)
+        alert(payload("paper_result", posSide, "PAPER_CLOSE", posWatch, posStop, posTarget, res), alert.freq_once_per_bar_close)
+        posSide   := 0
+        posWatch  := na
+        posStop   := na
+        posTarget := na
+
+bool newSetup = (longSetup or shortSetup) and barstate.isconfirmed
+bool canRecord = dayRecords < maxPerDay and dayLosses < maxLossDay and posSide == 0
+
+if newSetup
+    int side = longSetup ? 1 : -1
+    float watch = close
+    float stop = side == 1 ? failExt - atr * stopAtr : failExt + atr * stopAtr
+    float risk = math.abs(watch - stop)
+    float target = side == 1 ? watch + risk * rrMult : watch - risk * rrMult
+    string structure = side == 1 ? "SELLERS_FAILED_TWICE" : "BUYERS_FAILED_TWICE"
+    if risk > 0
+        color c = side == 1 ? color.green : color.red
+        line.new(bar_index, watch, bar_index + lineLen, watch, color = color.new(color.blue, 0), width = 2)
+        line.new(bar_index, stop, bar_index + lineLen, stop, color = color.new(color.red, 0), style = line.style_dashed)
+        line.new(bar_index, target, bar_index + lineLen, target, color = color.new(color.teal, 0), style = line.style_dashed)
+        label.new(bar_index + lineLen, watch, "观察 " + str.tostring(watch, format.mintick), style = label.style_label_left, color = color.new(color.blue, 20), textcolor = color.white, size = size.small)
+        label.new(bar_index + lineLen, stop, "止损 " + str.tostring(stop, format.mintick), style = label.style_label_left, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
+        label.new(bar_index + lineLen, target, "目标 " + str.tostring(target, format.mintick), style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.small)
+        if canRecord
+            dayRecords := dayRecords + 1
+            posSide    := side
+            posWatch   := watch
+            posStop    := stop
+            posTarget  := target
+            label.new(bar_index, side == 1 ? low : high, (side == 1 ? "失败 2 · 多头结构" : "失败 2 · 空头结构") + "\n纸面记录 " + str.tostring(dayRecords) + "/" + str.tostring(maxPerDay), style = side == 1 ? label.style_label_up : label.style_label_down, color = color.new(c, 10), textcolor = color.white, size = size.small)
+            alert(payload("setup", side, structure, watch, stop, target, "open"), alert.freq_once_per_bar_close)
+        else
+            string why = posSide != 0 ? "已有纸面记录" : dayLosses >= maxLossDay ? "今天已亏 " + str.tostring(dayLosses) + " 笔，停记" : "今天已记满 " + str.tostring(maxPerDay) + " 笔"
+            label.new(bar_index, side == 1 ? low : high, "结构出现，不记：" + why, style = side == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
+            alert(payload("setup", side, structure, watch, stop, target, "skipped"), alert.freq_once_per_bar_close)
+
+// ───────────── 状态标签 ─────────────
+var label biasLbl = na
+if barstate.islast
+    label.delete(biasLbl)
+    color bc = bias == 1 ? color.green : bias == -1 ? color.red : color.gray
+    string txt = biasTxt + "\n" + htf1 + ": " + str.tostring(stateA) + " · " + htf2 + ": " + str.tostring(stateB) + "\n今天纸面 " + str.tostring(dayRecords) + "/" + str.tostring(maxPerDay) + " · 亏 " + str.tostring(dayLosses) + "\n累计 到目标 " + str.tostring(totalWins) + " / 止损 " + str.tostring(totalLoss)
+    biasLbl := label.new(bar_index + 3, high, txt, style = label.style_label_left, color = color.new(bc, 15), textcolor = color.white, size = size.normal)
+
+plotshape(longSetup, "多头结构", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.tiny)
+plotshape(shortSetup, "空头结构", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)
