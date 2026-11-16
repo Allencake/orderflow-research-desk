@@ -1,12 +1,13 @@
 // This Pine Script® code is subject to the terms of the MIT License.
 // © 2026 Allencake
 //
-// Orderflow Research Desk —— 纸面研究指标（paper only）
-// 只做结构识别和纸面记录，不下单，不构成投资建议，不承诺收益。
+// Orderflow Research Desk —— 订单流交易信号指标
+// 识别「空头在关键区域砸了两次都没砸穿」，给出 LONG / SHORT、入场、止损、目标，并通过 alert() 推 JSON。
+// 只是指标和警报，不会替你下单。仅供学习交流，不构成投资建议，交易有风险。
 // 建议用在 5 分钟图上。
 
 //@version=5
-indicator("Orderflow Research Desk (paper only)", shorttitle = "OF Desk", overlay = true, max_boxes_count = 50, max_lines_count = 300, max_labels_count = 300)
+indicator("Orderflow Research Desk", shorttitle = "OF Desk", overlay = true, max_boxes_count = 50, max_lines_count = 300, max_labels_count = 300)
 
 // ───────────── 输入 ─────────────
 grpBias = "1. 大方向 (1h / 4h)"
@@ -33,10 +34,13 @@ wickMin   = input.float(0.40, "长影线占比下限", minval = 0.1, maxval = 1.
 stopAtr   = input.float(0.10, "止损缓冲 (ATR 倍数)", minval = 0.0, step = 0.05, group = grpFlow)
 rrMult    = input.float(2.0, "目标 = 风险的几倍", minval = 0.5, step = 0.5, group = grpFlow)
 
-grpPaper = "5. 纸面规则"
-maxPerDay  = input.int(2, "每天最多记几笔", minval = 1, group = grpPaper)
-maxLossDay = input.int(2, "当天亏满几笔就停记", minval = 1, group = grpPaper)
-lineLen    = input.int(30, "价位线长度 (根)", minval = 5, maxval = 400, group = grpPaper)
+grpRules = "5. 交易规则"
+maxPerDay  = input.int(2, "每天最多几笔", minval = 1, group = grpRules)
+maxLossDay = input.int(2, "当天亏满几笔就停手", minval = 1, group = grpRules)
+useTrail   = input.bool(true, "移动止损", group = grpRules)
+trailStart = input.float(1.0, "浮盈到几倍风险后开始移动", minval = 0.1, step = 0.1, group = grpRules)
+trailAtr   = input.float(1.5, "移动止损距离 (ATR 倍数)", minval = 0.1, step = 0.1, group = grpRules)
+lineLen    = input.int(30, "价位线长度 (根)", minval = 5, maxval = 400, group = grpRules)
 
 // ───────────── 1. 大方向：1h / 4h，不重绘 ─────────────
 // 返回上一根已收盘大周期 K 线的状态：1 = 向上，-1 = 向下，0 = 平衡。
@@ -166,26 +170,28 @@ if zoneLive and touch and zSide == -1 and bullFailed
         shortSetup := biasOkShort and locOkShort
         zoneLive   := false
 
-// ───────────── 5. 纸面规则：每天最多 2 笔，亏 2 笔停记 ─────────────
-var int   dayRecords = 0
-var int   dayLosses  = 0
-var int   posSide    = 0     // 0 = 无纸面记录，1 = 多，-1 = 空
-var float posWatch   = na
-var float posStop    = na
-var float posTarget  = na
-var int   totalWins  = 0
-var int   totalLoss  = 0
+// ───────────── 5. 交易规则：每天最多 2 笔，亏 2 笔停手，移动止损 ─────────────
+var int   dayTrades = 0
+var int   dayLosses = 0
+var int   tradeSide = 0     // 0 = 空仓，1 = 多，-1 = 空
+var float tEntry    = na
+var float tStop     = na    // 当前止损（会被移动止损推着走）
+var float tInitStop = na    // 初始止损，用来算 1R
+var float tTarget   = na
+var bool  trailOn   = false
+var int   totalWins = 0
+var int   totalLoss = 0
 
 if newDay
-    dayRecords := 0
-    dayLosses  := 0
+    dayTrades := 0
+    dayLosses := 0
 
 fmtP = "#.##########"
 
 zoneJson() =>
     '{"top":' + str.tostring(zTop, fmtP) + ',"bottom":' + str.tostring(zBot, fmtP) + ',"fib":"' + str.tostring(fibLoR) + '-' + str.tostring(fibHiR) + '"}'
 
-payload(string event, int side, string structure, float watch, float stop, float target, string result) =>
+payload(string event, int side, string structure, float entry, float stop, float target, string result, string extra) =>
     '{"event":"' + event + '"' +
      ',"symbol":"' + syminfo.ticker + '"' +
      ',"exchange":"' + syminfo.prefix + '"' +
@@ -193,73 +199,96 @@ payload(string event, int side, string structure, float watch, float stop, float
      ',"bias":"' + biasTxt + '"' +
      ',"htf":{"' + htf1 + '":' + str.tostring(stateA) + ',"' + htf2 + '":' + str.tostring(stateB) + '}' +
      ',"location":"' + locTxt + '"' +
-     ',"side":"' + (side == 1 ? "long" : "short") + '"' +
+     ',"side":"' + (side == 1 ? "LONG" : "SHORT") + '"' +
      ',"zone":' + zoneJson() +
      ',"structure":"' + structure + '"' +
-     ',"watch":' + str.tostring(watch, fmtP) +
+     ',"entry":' + str.tostring(entry, fmtP) +
      ',"stop":' + str.tostring(stop, fmtP) +
      ',"target":' + str.tostring(target, fmtP) +
+     ',"rr":' + str.tostring(rrMult) +
      ',"result":"' + result + '"' +
-     ',"paper_today":{"records":' + str.tostring(dayRecords) + ',"losses":' + str.tostring(dayLosses) + '}' +
+     ',"today":{"trades":' + str.tostring(dayTrades) + ',"losses":' + str.tostring(dayLosses) + ',"max_trades":' + str.tostring(maxPerDay) + ',"max_losses":' + str.tostring(maxLossDay) + '}' +
+     extra +
      ',"ts":' + str.tostring(time_close, "#") + '}'
 
-// 先结算已有的纸面记录（保守：同一根 K 线同时碰到止损和目标，按止损算）
-if posSide != 0 and barstate.isconfirmed
-    bool hitStop   = posSide == 1 ? low <= posStop : high >= posStop
-    bool hitTarget = posSide == 1 ? high >= posTarget : low <= posTarget
+// 先管理已有持仓：止损 / 目标（同一根 K 线两个都碰到按止损算），没出场就更新移动止损
+if tradeSide != 0 and barstate.isconfirmed
+    bool hitStop   = tradeSide == 1 ? low <= tStop : high >= tStop
+    bool hitTarget = tradeSide == 1 ? high >= tTarget : low <= tTarget
+    float risk0 = math.abs(tEntry - tInitStop)
     if hitStop or hitTarget
-        string res = hitStop ? "stop" : "target"
-        if hitStop
+        float px = hitStop ? tStop : tTarget
+        float r = risk0 > 0 ? (px - tEntry) * tradeSide / risk0 : 0.0
+        string res = not hitStop ? "TARGET" : r > 0 ? "TRAIL_STOP_WIN" : r == 0 ? "BREAKEVEN" : "STOP_LOSS"
+        if r < 0
             dayLosses := dayLosses + 1
             totalLoss := totalLoss + 1
-        else
+        else if r > 0
             totalWins := totalWins + 1
-        float px = hitStop ? posStop : posTarget
-        label.new(bar_index, px, hitStop ? "纸面：止损" : "纸面：到目标", style = label.style_label_left, color = hitStop ? color.new(color.red, 20) : color.new(color.teal, 20), textcolor = color.white, size = size.small)
-        alert(payload("paper_result", posSide, "PAPER_CLOSE", posWatch, posStop, posTarget, res), alert.freq_once_per_bar_close)
-        posSide   := 0
-        posWatch  := na
-        posStop   := na
-        posTarget := na
+        string txt = res == "TARGET" ? "到目标" : res == "TRAIL_STOP_WIN" ? "移动止损出场" : res == "BREAKEVEN" ? "保本出场" : "止损"
+        label.new(bar_index, px, txt + " " + str.tostring(r, "#.##") + "R", style = label.style_label_left, color = r < 0 ? color.new(color.red, 20) : color.new(color.teal, 20), textcolor = color.white, size = size.small)
+        alert(payload("exit", tradeSide, "EXIT", tEntry, tStop, tTarget, res, ',"exit":' + str.tostring(px, fmtP) + ',"r":' + str.tostring(r, "#.##")), alert.freq_once_per_bar_close)
+        tradeSide := 0
+        tEntry    := na
+        tStop     := na
+        tInitStop := na
+        tTarget   := na
+        trailOn   := false
+    else if useTrail and risk0 > 0
+        float fav = tradeSide == 1 ? high - tEntry : tEntry - low
+        if fav >= risk0 * trailStart
+            trailOn := true
+        if trailOn
+            // 只往有利方向移，且至少保本
+            if tradeSide == 1
+                tStop := math.max(tStop, math.max(close - atr * trailAtr, tEntry))
+            else
+                tStop := math.min(tStop, math.min(close + atr * trailAtr, tEntry))
 
-bool newSetup = (longSetup or shortSetup) and barstate.isconfirmed
-bool canRecord = dayRecords < maxPerDay and dayLosses < maxLossDay and posSide == 0
+plot(tradeSide != 0 ? tStop : na, "当前止损（移动）", color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 2)
 
-if newSetup
+bool newSignal = (longSetup or shortSetup) and barstate.isconfirmed
+bool canTrade  = dayTrades < maxPerDay and dayLosses < maxLossDay and tradeSide == 0
+
+if newSignal
     int side = longSetup ? 1 : -1
-    float watch = close
+    float entry = close
     float stop = side == 1 ? failExt - atr * stopAtr : failExt + atr * stopAtr
-    float risk = math.abs(watch - stop)
-    float target = side == 1 ? watch + risk * rrMult : watch - risk * rrMult
-    string structure = side == 1 ? "SELLERS_FAILED_TWICE" : "BUYERS_FAILED_TWICE"
+    float risk = math.abs(entry - stop)
+    float target = side == 1 ? entry + risk * rrMult : entry - risk * rrMult
+    string structure = side == 1 ? "SELLERS_TRAPPED_TWICE" : "BUYERS_TRAPPED_TWICE"
+    string sideTxt = side == 1 ? "LONG" : "SHORT"
     if risk > 0
         color c = side == 1 ? color.green : color.red
-        line.new(bar_index, watch, bar_index + lineLen, watch, color = color.new(color.blue, 0), width = 2)
+        line.new(bar_index, entry, bar_index + lineLen, entry, color = color.new(color.blue, 0), width = 2)
         line.new(bar_index, stop, bar_index + lineLen, stop, color = color.new(color.red, 0), style = line.style_dashed)
         line.new(bar_index, target, bar_index + lineLen, target, color = color.new(color.teal, 0), style = line.style_dashed)
-        label.new(bar_index + lineLen, watch, "观察 " + str.tostring(watch, format.mintick), style = label.style_label_left, color = color.new(color.blue, 20), textcolor = color.white, size = size.small)
+        label.new(bar_index + lineLen, entry, "入场 " + str.tostring(entry, format.mintick), style = label.style_label_left, color = color.new(color.blue, 20), textcolor = color.white, size = size.small)
         label.new(bar_index + lineLen, stop, "止损 " + str.tostring(stop, format.mintick), style = label.style_label_left, color = color.new(color.red, 20), textcolor = color.white, size = size.small)
         label.new(bar_index + lineLen, target, "目标 " + str.tostring(target, format.mintick), style = label.style_label_left, color = color.new(color.teal, 20), textcolor = color.white, size = size.small)
-        if canRecord
-            dayRecords := dayRecords + 1
-            posSide    := side
-            posWatch   := watch
-            posStop    := stop
-            posTarget  := target
-            label.new(bar_index, side == 1 ? low : high, (side == 1 ? "失败 2 · 多头结构" : "失败 2 · 空头结构") + "\n纸面记录 " + str.tostring(dayRecords) + "/" + str.tostring(maxPerDay), style = side == 1 ? label.style_label_up : label.style_label_down, color = color.new(c, 10), textcolor = color.white, size = size.small)
-            alert(payload("setup", side, structure, watch, stop, target, "open"), alert.freq_once_per_bar_close)
+        if canTrade
+            dayTrades := dayTrades + 1
+            tradeSide := side
+            tEntry    := entry
+            tStop     := stop
+            tInitStop := stop
+            tTarget   := target
+            trailOn   := false
+            label.new(bar_index, side == 1 ? low : high, sideTxt + "\n今日第 " + str.tostring(dayTrades) + "/" + str.tostring(maxPerDay) + " 笔", style = side == 1 ? label.style_label_up : label.style_label_down, color = color.new(c, 0), textcolor = color.white, size = size.normal)
+            alert(payload("signal", side, structure, entry, stop, target, "OPEN", ""), alert.freq_once_per_bar_close)
         else
-            string why = posSide != 0 ? "已有纸面记录" : dayLosses >= maxLossDay ? "今天已亏 " + str.tostring(dayLosses) + " 笔，停记" : "今天已记满 " + str.tostring(maxPerDay) + " 笔"
-            label.new(bar_index, side == 1 ? low : high, "结构出现，不记：" + why, style = side == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
-            alert(payload("setup", side, structure, watch, stop, target, "skipped"), alert.freq_once_per_bar_close)
+            string why = tradeSide != 0 ? "已有持仓" : dayLosses >= maxLossDay ? "今天已亏 " + str.tostring(dayLosses) + " 笔，停手" : "今天已做满 " + str.tostring(maxPerDay) + " 笔"
+            label.new(bar_index, side == 1 ? low : high, sideTxt + "（不做：" + why + "）", style = side == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 20), textcolor = color.white, size = size.small)
+            alert(payload("signal", side, structure, entry, stop, target, "BLOCKED", ',"reason":"' + why + '"'), alert.freq_once_per_bar_close)
 
 // ───────────── 状态标签 ─────────────
 var label biasLbl = na
 if barstate.islast
     label.delete(biasLbl)
     color bc = bias == 1 ? color.green : bias == -1 ? color.red : color.gray
-    string txt = biasTxt + "\n" + htf1 + ": " + str.tostring(stateA) + " · " + htf2 + ": " + str.tostring(stateB) + "\n今天纸面 " + str.tostring(dayRecords) + "/" + str.tostring(maxPerDay) + " · 亏 " + str.tostring(dayLosses) + "\n累计 到目标 " + str.tostring(totalWins) + " / 止损 " + str.tostring(totalLoss)
+    string pos = tradeSide == 1 ? "持仓 LONG" : tradeSide == -1 ? "持仓 SHORT" : "空仓"
+    string txt = biasTxt + "\n" + htf1 + ": " + str.tostring(stateA) + " · " + htf2 + ": " + str.tostring(stateB) + "\n今天 " + str.tostring(dayTrades) + "/" + str.tostring(maxPerDay) + " 笔 · 亏 " + str.tostring(dayLosses) + " · " + pos + "\n累计 盈 " + str.tostring(totalWins) + " / 亏 " + str.tostring(totalLoss)
     biasLbl := label.new(bar_index + 3, high, txt, style = label.style_label_left, color = color.new(bc, 15), textcolor = color.white, size = size.normal)
 
-plotshape(longSetup, "多头结构", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.tiny)
-plotshape(shortSetup, "空头结构", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)
+plotshape(longSetup, "LONG 信号", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.tiny)
+plotshape(shortSetup, "SHORT 信号", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)

@@ -8,6 +8,7 @@ venv/
 .env
 server/ledger.csv
 server/replies.log
+server/decisions.csv
 *.log
 
 # 系统文件
